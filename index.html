@@ -1,0 +1,909 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>야경</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #06080f; overflow: hidden; }
+  canvas { width: 100%; height: 100%; display: block; image-rendering: pixelated; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// ---- 조절값 ----
+const PX = 2;            // 도트 크기. 클수록 굵은 도트
+const LEN = 400;         // 도로 길이
+const HY = 8;            // 고가도로 높이
+const RW = 12;           // 도로 반폭 (방향당 3차로, 차로 중심은 중심선에서 2, 6, 10)
+const STOP = -18;        // 정지선 (차 중심 기준, 교차로 중심이 0)
+const E = 16;            // 교차로 가장자리: 회전은 s=-E 에서 시작해서 목적 차로의 s=+E 로 합류
+const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]];  // 진행 방향 h: 0 동(+x), 1 남(+z), 2 서(-x), 3 북(-z). 시계 방향이라 오른쪽은 (h+1)%4
+const ZB = -80;          // 길 B(동서 도로)의 z 위치. 큰길은 x=0 남북 도로, 길 A는 z=0 동서 도로
+// 한 축의 신호 순서 (선행 좌회전): L 빨강+좌회전 화살표, LY 노랑, R 전체 빨강, G 초록, GY 노랑, R. 큰길(남북, z 축)이 동서(x 축)보다 길다 (간선도로 우선)
+const SEQ = {
+  x: [['L', 4.5], ['LY', 1.5], ['R', 2], ['G', 7], ['GY', 1.5], ['R', 2]],
+  z: [['L', 6], ['LY', 1.5], ['R', 2], ['G', 24], ['GY', 1.5], ['R', 2]],
+};
+const TX = SEQ.x.reduce((a, [, d]) => a + d, 0), CYCLE = TX + SEQ.z.reduce((a, [, d]) => a + d, 0);  // 신호 한 주기(초): 앞 TX 초는 동서 축, 나머지는 남북 축이 한 바퀴
+// 교차로(노드) 2개: 큰길과 길 A, 큰길과 길 B. off 는 신호 시계를 몇 초 앞당길지 (두 교차로를 같은 시각에 맞춤.
+// 6초 어긋나게 하면 늦게 켜지는 쪽 방향의 줄이 두 교차로 사이(차로당 약 7대)에 넘쳐서, 다른 교차로 안에 차가 서거나 그 차로로 우회전하는 차가 90초 넘게 못 들어감)
+// st 는 매 프레임 신호 상태, done 은 이 교차로에서 마친 좌회전 직진 우회전 횟수와 그중 동서 방향에서 온 직진 횟수 EW (신호등 재질은 아래에서 채움)
+const nodes = [{ x: 0, z: 0, off: 0 }, { x: 0, z: ZB, off: 0 }].map(n => ({ ...n, st: {}, done: { L: 0, S: 0, R: 0, EW: 0 } }));
+
+// ---- 화면 준비 ----
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x06080f);
+scene.fog = new THREE.Fog(0x06080f, 230, 520);
+const camera = new THREE.PerspectiveCamera(40, 1, 1, 1200);
+camera.position.set(34, 150, 198);
+// ponytail: 작게 그리고 CSS로 확대하는 것만으로 도트 느낌을 냄. 디더링이나 색 수 제한이 필요하면 후처리 셰이더 추가
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+document.body.append(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 32);
+controls.maxPolarAngle = 1.25; controls.minDistance = 40; controls.maxDistance = 360;
+function resize() {
+  renderer.setSize(innerWidth / PX | 0, innerHeight / PX | 0, false);
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+// ---- 도우미 ----
+// 조명 계산 없이 색을 그대로 칠하는 재질만 쓴다 (밤 장면이라 빛은 전부 가짜 글로우로 표현)
+const basic = (color, opt) => new THREE.MeshBasicMaterial({ color, ...opt });
+function canvasTex(w, h, draw) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  draw(c.getContext('2d'));
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace; t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.magFilter = THREE.NearestFilter;
+  return t;
+}
+// ponytail: 신호등, 가로등, 램프 같은 소품은 메시를 하나씩 추가함 (차는 이미 한 대당 메시 4개로 합침). 느려지면 소품도 mergeGeometries 로 합치거나 InstancedMesh로 교체
+function box(w, h, d, mat, x, y, z, parent = scene) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z); parent.add(m); return m;
+}
+function flat(w, d, mat, x, y, z, ry = 0, parent = scene) {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, d).rotateX(-Math.PI / 2), mat);
+  m.position.set(x, y, z); m.rotation.y = ry; parent.add(m); return m;
+}
+
+// ---- 그림 재료 (전부 코드로 그림) ----
+const roadTex = canvasTex(32, 96, g => {  // 폭 24 = 6차로: 세로 96 칸 (1 유닛 = 4 칸)
+  g.fillStyle = '#171a21'; g.fillRect(0, 0, 32, 96);
+  g.fillStyle = '#7d838f'; g.fillRect(0, 1, 32, 1); g.fillRect(0, 94, 32, 1);  // 가장자리 실선
+  for (const y of [15, 31, 63, 79]) g.fillRect(0, y, 16, 2);                  // 차로 경계 점선 4줄 (중심선에서 8, 4, 4, 8)
+  g.fillStyle = '#a8842a'; g.fillRect(0, 47, 32, 2);                          // 중앙선
+});
+roadTex.repeat.set(LEN / 8, 1);
+const zebraTex = canvasTex(8, 8, g => {
+  g.fillStyle = '#171a21'; g.fillRect(0, 0, 8, 8);
+  g.fillStyle = '#8d93a0'; g.fillRect(0, 0, 8, 4);
+});
+zebraTex.repeat.set(1, 12);
+const glowTex = canvasTex(32, 32, g => {
+  const r = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+  r.addColorStop(0, '#fff'); r.addColorStop(1, '#000');
+  g.fillStyle = r; g.fillRect(0, 0, 32, 32);
+});
+// 바닥에 깔아서 빛이 번진 것처럼 보이게 하는 재질
+const glow = (color, opacity) => basic(color, {
+  map: glowTex, transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false,
+});
+
+// ---- 땅, 도로, 횡단보도 ----
+const road = basic(0xffffff, { map: roadTex, side: THREE.DoubleSide }), zebra = basic(0xffffff, { map: zebraTex });
+const asphalt = basic(0x171a21), concrete = basic(0x232732, { side: THREE.DoubleSide });
+flat(LEN, 2 * RW, road, 0, .02, 0);                 // 동서 도로
+flat(LEN, 2 * RW, road, 0, .02, 0, Math.PI / 2);    // 남북 도로 (큰길)
+flat(LEN, 2 * RW, road, 0, .02, ZB);                // 동서 도로 B
+for (const n of nodes) {
+  flat(2 * RW, 2 * RW, asphalt, n.x, .04, n.z);     // 교차로 한가운데
+  for (const s of [-14, 14]) {                      // 횡단보도 (중심에서 14 떨어진 곳, 길이 24)
+    flat(3, 2 * RW, zebra, n.x + s, .05, n.z);
+    flat(3, 2 * RW, zebra, n.x, .05, n.z + s, Math.PI / 2);
+  }
+}
+
+// ---- 고가 고속도로 (곡선) ----
+// 아래 [x, z] 점들을 부드럽게 잇는 곡선이 고속도로의 중심선. 점을 옮기면 길 모양이 바뀐다
+// 곡선은 서에서 동으로 간다. dir=+1 이 동행(남쪽 차선, 강 쪽), dir=-1 이 서행(북쪽 차선, 도심 쪽)
+const hw = new THREE.CatmullRomCurve3(
+  [[-260, 82], [-160, 64], [-70, 56], [0, 60], [80, 72], [170, 68], [260, 50]]
+    .map(([x, z]) => new THREE.Vector3(x, HY, z)), false, 'centripetal');
+const HLEN = hw.getLength();
+const P = new THREE.Vector3(), T = new THREE.Vector3();  // 곡선 위의 점과 진행 방향을 담는 임시 변수
+const hwPts = hw.getSpacedPoints(120);
+// 곡선을 따라 띠 모양 면을 만든다. 띠의 양쪽 가장자리를 (중심선에서 옆으로 벗어난 거리, 곡선 점의 높이에 더하는 값)으로 받는다
+// keep(점, 접선) 이 false 인 곳은 면을 비운다
+function ribbon(curve, offA, dyA, offB, dyB, mat, keep) {
+  const N = 200, L = curve.getLength(), pos = [], uv = [], idx = [], ok = [];
+  for (let i = 0; i <= N; i++) {
+    curve.getPointAt(i / N, P); curve.getTangentAt(i / N, T);
+    const k = 1 / Math.hypot(T.x, T.z);  // 경사진 곡선에서도 옆으로 벗어난 거리가 수평으로 맞게
+    ok.push(!keep || keep(P, T));
+    pos.push(P.x - T.z * k * offA, P.y + dyA, P.z + T.x * k * offA, P.x - T.z * k * offB, P.y + dyB, P.z + T.x * k * offB);
+    uv.push(i / N * L / LEN, 0, i / N * L / LEN, 1);
+  }
+  for (let i = 0; i < N; i++) if (ok[i] && ok[i + 1]) idx.push(i * 2, i * 2 + 1, i * 2 + 2, i * 2 + 1, i * 2 + 3, i * 2 + 2);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  scene.add(new THREE.Mesh(g, mat));
+}
+ribbon(hw, -RW, 0, RW, 0, road);                                   // 노면
+ribbon(hw, -RW, -1, RW, -1, concrete);                             // 바닥면
+for (const o of [-RW, RW]) ribbon(hw, o, -1, o, .8, concrete, p => Math.abs(p.x) <= 30 || Math.abs(p.x) >= 86);  // 옆면 겸 방호벽 (램프가 붙는 |x| 30~86 은 끊음)
+for (let a = 12; a < HLEN; a += 24) {                              // 기둥 (아래 도로 위는 건너뜀)
+  hw.getPointAt(a / HLEN, P);
+  if (Math.abs(P.x) > RW + 3 && Math.abs(P.z) > RW + 3) box(2, HY - 1, 2, concrete, P.x, (HY - 1) / 2, P.z);
+}
+
+// ---- 램프 4개 (고속도로와 큰길의 바깥 차로(k=2)를 잇는 1차로 연결로) ----
+// 고속도로 중심선에서 x 좌표가 x 인 곳을 찾아(곡선을 촘촘히 훑음), 옆으로 off(남쪽이 +)만큼 옮기고 높이를 y 로 한 점과 그곳의 호 길이 위치 a
+const hwFine = hw.getSpacedPoints(2000);  // 호 길이로 같은 간격. x 가 서에서 동으로 늘어남
+function hwAt(x, off, y) {
+  const i = hwFine.findIndex(p => p.x >= x), a = (i - 1 + (x - hwFine[i - 1].x) / (hwFine[i].x - hwFine[i - 1].x)) / 2000 * HLEN;
+  hw.getPointAt(a / HLEN, P); hw.getTangentAt(a / HLEN, T);
+  return { a, pt: new THREE.Vector3(P.x - T.z * off, y, P.z + T.x * off) };
+}
+const north = (x, o, y = HY) => hwAt(x, -o, y).pt, south = (x, o, y = HY) => hwAt(x, o, y).pt;  // 고속도로 점 [x, 옆거리, 높이]
+const gp = (x, z, y) => new THREE.Vector3(x, y, z);                                             // 지상 점 [x, z, 높이]
+const ramps = [
+  [north(84, 10), north(70, 11), north(56, 14.5), north(44, 17, 6.8), north(32, 19, 5), gp(20, 43.5, 2.6), gp(13, 39, 1), gp(10, 33, .2), gp(10, 26, 0)],         // R1 서행 진출 > 큰길 북행 바깥 차로
+  [gp(-10, 20, 0), gp(-10, 27, .2), gp(-13, 33.5, 1), gp(-20, 38.5, 2.6), north(-32, 19, 5), north(-44, 17, 6.8), north(-56, 14.5), north(-70, 11), north(-84, 10)],  // R2 큰길 남행 바깥 차로 > 서행 진입
+  [south(-84, 10), south(-70, 11), south(-56, 14.5), south(-44, 17, 6.8), south(-32, 19, 5), gp(-20, 79, 2.6), gp(-13, 84, 1), gp(-10, 91, .2), gp(-10, 98, 0)],     // R3 동행 진출 > 큰길 남행 바깥 차로
+  [gp(10, 98, 0), gp(10, 91, .2), gp(13, 86.5, 1), gp(20, 82.5, 2.6), south(32, 19, 5), south(44, 17, 6.8), south(56, 14.5), south(70, 11), south(84, 10)],         // R4 큰길 북행 바깥 차로 > 동행 진입
+].map(pts => { const curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal'); return { curve, len: curve.getLength(), done: 0 }; });
+const hwDist = (x, z) => Math.min(...hwPts.map(p => Math.hypot(p.x - x, p.z - z)));  // 고속도로 중심선까지의 대략적인 거리
+for (const r of ramps) {
+  ribbon(r.curve, -3, .03, 3, .03, asphalt);   // 상판 (폭 6, 땅과 겹쳐 깜빡이지 않게 살짝 띄움)
+  ribbon(r.curve, -3, -1, 3, -1, concrete);    // 바닥면
+  for (const o of [-3, 3]) ribbon(r.curve, o, -1, o, .8, concrete, (p, t) => {  // 양쪽 낮은 벽
+    const k = 1 / Math.hypot(t.x, t.z), w = hwDist(p.x - t.z * k * o, p.z + t.x * k * o);
+    return p.y >= .6 && !(w < 16 && w < hwDist(p.x, p.z));  // 지상 합류부와, 고속도로 쪽을 향한 면 중 중심선에서 16 이내인 곳은 비움 (차가 드나드는 곳)
+  });
+  for (let a = 14; a < r.len; a += 14) {       // 기둥 (상판이 2보다 높은 곳만. 아래 끝은 y=-4 까지)
+    r.curve.getPointAt(a / r.len, P);
+    if (P.y > 2) box(1.5, P.y + 3, 1.5, concrete, P.x, (P.y - 5) / 2, P.z);
+  }
+}
+const rampPts = ramps.flatMap(r => r.curve.getSpacedPoints(100));
+
+// ---- 가로등 ----
+const bulb = basic(0xffb45e), lampGlow = glow(0xffa040, .35);
+function lamp(x, y, z) {
+  box(.3, 6, .3, concrete, x, y + 3, z);
+  box(1, .4, 1, bulb, x, y + 6, z);
+  flat(16, 16, lampGlow, x, y + .06, z);
+}
+for (let i = -190, k = 0; i <= 190; i += 20, k++) {
+  const s = k % 2 ? RW + 1.5 : -(RW + 1.5);
+  if (Math.abs(i) > RW) { lamp(i, 0, s); lamp(i, 0, ZB + s); }         // 길 A, 길 B 를 따라
+  if (i < 82 && nodes.every(n => Math.abs(i - n.z) > RW) && !rampPts.some(p => p.y > .3 && Math.hypot(p.x - s, p.z - i) < 5.5)) lamp(s, 0, i);  // 큰길을 따라 (교차로 가까이, 램프 자리, 강 위(z 82 부터)는 비움)
+}
+for (let a = 0; a < HLEN; a += 24) { hw.getPointAt(a / HLEN, P); lamp(P.x, HY, P.z); }  // 고속도로 중앙분리대
+
+// ---- 신호등 (가로형 4색등: 운전자 기준 왼쪽부터 빨강, 노랑, 좌회전 화살표, 초록) ----
+// 교차로(노드)마다 진입 방향 하나씩 4개. 렌즈 재질은 노드별로 축(x, z)별 렌즈별로 공유해서 색을 한 번에 바꿈
+// ponytail: 화살표 모양은 안 그림 (해상도가 낮아 안 보임). 화살표 렌즈는 초록과 구분되는 청록색으로만 표시
+const LENS = [0xff3030, 0xffc13a, 0x30e8d0, 0x35ff7a];  // 렌즈가 켜졌을 때 색
+const lampBox = basic(0x12141a);
+for (const n of nodes) {
+  n.lens = { x: LENS.map(() => basic(0)), z: LENS.map(() => basic(0)) };  // 렌즈 재질 (축별 4개)
+  n.glow = { x: glow(0, .45), z: glow(0, .45) };                           // 바닥 번짐 재질 (축별 1개)
+  for (let h = 0; h < 4; h++) {
+    const [fx, fz] = DIRS[h], [rx, rz] = DIRS[(h + 1) % 4], axis = h % 2 ? 'z' : 'x';
+    // 기둥 자리(진입 차로 오른쪽 길가)에 묶음을 놓고, 묶음 안에서 +x 가 진행 방향, +z 가 오른쪽이 되게 돌린다
+    const g = new THREE.Group();
+    g.position.set(n.x - (E + 1) * fx + (RW + 1.5) * rx, 0, n.z - (E + 1) * fz + (RW + 1.5) * rz); g.rotation.y = -h * Math.PI / 2; scene.add(g);
+    box(.4, 8.25, .4, concrete, 0, 4.125, 0, g);   // 기둥
+    box(.3, .3, 12.4, concrete, 0, 8.1, -6.1, g);  // 가로 팔: 기둥 꼭대기에서 도로 중심선 쪽(-z)으로 세 차로 위까지
+    box(.6, .6, 4.6, lampBox, 0, 7.5, -7.5, g);    // 등기구 (어두운 가로 상자, 가운데 차로 위)
+    for (let i = 0; i < 4; i++) box(.8, .8, .8, n.lens[axis][i], 0, 7.5, -7.5 + (i - 1.5) * 1.1, g);  // 렌즈는 상자보다 살짝 커서 위에서도 보임
+    flat(12, 12, n.glow[axis], 0, .07, 0, 0, g);   // 바닥의 색 번짐
+  }
+}
+
+// ---- 배경 (scenery-final.js 의 buildScenery 를 그대로 옮김): 한강, 땅, 호안, 한강공원, 다리, 건물, 가로수 ----
+// 밤 장면의 배경 전부: 한강, 한강공원, 마포대교, 건물, 가로수.
+// index.html 의 <script type="module"> 안으로 그대로 옮겨 쓴다. 반환값 update(dt, t) 를 매 프레임 부르면 물결이 흐른다.
+// 도로 폭에서 나온 숫자는 전부 RW(도로 반폭, ctx 로 받음)로 적었다.
+function buildScenery(ctx) {
+  const { THREE, scene, basic, glow, canvasTex, mergeGeometries, hw, ZB, RW } = ctx;
+  let seed = 20240607;  // 매번 같은 풍경이 나오도록 Math.random 대신 쓰는 난수
+  const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+  const pick = a => a[rnd() * a.length | 0];
+  const RX = 64, RZ = RW + 10;  // 램프 구역: |x| < RX 이고 z > RZ (건물, 나무, 공원 가로등을 두지 않음)
+  const RC = RW + 8;            // 교차로와 도로에서 건물, 가로수를 비우는 거리 (도로 중심선 기준)
+
+  // ---- 0. 준비 ----
+  // 고속도로 중심선을 400 개 점으로 샘플링한다. (nx, nz) 는 남쪽(+z)을 향한 단위 법선
+  const N = 400, S = [];
+  for (let i = 0; i <= N; i++) {
+    const p = hw.getPointAt(i / N), t = hw.getTangentAt(i / N);
+    S.push({ x: p.x, z: p.z, nx: -t.z, nz: t.x });
+  }
+  const pt = (s, d, y) => [s.x + s.nx * d, y, s.z + s.nz * d];  // 중심선에서 남쪽으로 d 만큼 떨어진 점
+
+  // 강기슭 선 = 중심선 + 남쪽 RW + 14. 양 끝은 x = -700, 700 까지 같은 z 로 곧게 뺀다
+  // ponytail: 평행 이동이라 곡률 반경이 RW + 14 보다 작은 급커브가 생기면 선이 꼬인다 (지금 곡선은 완만함)
+  const sh = S.map(s => pt(s, RW + 14, 0));
+  const shore = [[-700, 0, sh[0][2]], ...sh, [700, 0, sh[N][2]]];
+  function shoreZ(x) {  // 강기슭 선의 x 위치에서의 z (선분 사이를 보간)
+    for (let i = 1; i < shore.length; i++) {
+      const [x0, , z0] = shore[i - 1], [x1, , z1] = shore[i];
+      if (x >= x0 && x <= x1) return z0 + (z1 - z0) * (x - x0) / (x1 - x0);
+    }
+  }
+
+  // 색이 하나뿐인 것(땅, 벽, 상판, 지붕, 간판...)은 꼭짓점 색을 입혀 solid 목록에 모았다가 마지막에 메시 1개로 합친다
+  const solid = [];
+  function paint(g, hex) {
+    g.deleteAttribute('normal'); g.deleteAttribute('uv');  // 합치려면 속성 구성이 같아야 해서 색 외에는 지운다
+    const c = new THREE.Color(hex), col = [];
+    for (let i = 0; i < g.attributes.position.count; i++) col.push(c.r, c.g, c.b);
+    g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    solid.push(g);
+  }
+  const put = (w, h, d, x, y, z, hex) => paint(new THREE.BoxGeometry(w, h, d).translate(x, y, z), hex);
+  const quad = (w, d, x, y, z, hex) => paint(new THREE.PlaneGeometry(w, d).rotateX(-Math.PI / 2).translate(x, y, z), hex);
+  // 점 쌍 (A[i], B[i]) 을 이어 만든 띠. 각 점은 [x, y, z]. 감는 방향을 신경 쓰지 않으려고 재질은 양면으로 그린다
+  function ribbon(A, B) {
+    const pos = [], idx = [];
+    for (let i = 0; i < A.length; i++) {
+      pos.push(...A[i], ...B[i]);
+      if (i) idx.push(2 * i - 2, 2 * i - 1, 2 * i, 2 * i - 1, 2 * i + 1, 2 * i);
+    }
+    return new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)).setIndex(idx);
+  }
+  // 고속도로 중심선에서 남쪽으로 d0 ~ d1 떨어진 띠. 큰길(폭 2 * RW)이 지나는 가운데는 띠 양쪽 가장자리가 모두 |x| > RW + 1 인 구간만 남겨서 뺀다
+  function band(d0, d1, y, hex) {
+    for (const sign of [-1, 1]) {
+      const run = S.filter(s => sign * pt(s, d0, 0)[0] > RW + 1 && sign * pt(s, d1, 0)[0] > RW + 1);
+      paint(ribbon(run.map(s => pt(s, d0, y)), run.map(s => pt(s, d1, y))), hex);
+    }
+  }
+  // 바닥에 깔 가산 혼합 글로우 면 (종류별로 모았다가 메시 1개로 합친다)
+  const glowQuad = (w, d, x, y, z) => new THREE.PlaneGeometry(w, d).rotateX(-Math.PI / 2).translate(x, y, z);
+  const parkGlow = [], deckGlow = [], reflect = [];
+
+  // ---- 1. 한강, 땅, 호안 ----
+  // 물은 두 겹: (가) 어두운 바탕 물결, (나) 그 위(0.02)에 가산 혼합으로 얹는 드문드문한 밝은 잔물결.
+  // 둘 다 서쪽(-x)으로 흐르고 (나)가 두 배 빨라서 속도 차이로 흐름이 느껴진다. 무늬 한 장의 크기(유닛)와 속도(유닛/초)
+  const TILE1 = 48, TILE2 = 64, V1 = 1.5, V2 = 3;
+  function rippleTex(bg, n, len0, len1, cols, thick) {  // 가로로 짧은 선 n 개를 흩뿌린 128 x 128 무늬 (thick 확률로 2칸 두께). 선이 무늬 가장자리를 넘지 않게 해서 이음새가 안 보임
+    return canvasTex(128, 128, g => {
+      g.fillStyle = bg; g.fillRect(0, 0, 128, 128);
+      for (let i = 0; i < n; i++) {
+        const len = len0 + rnd() * (len1 - len0) | 0;
+        g.fillStyle = pick(cols);
+        g.fillRect(rnd() * (128 - len) | 0, rnd() * 128 | 0, len, rnd() < thick ? 2 : 1);
+      }
+    });
+  }
+  const waterTex = rippleTex('#08121f', 60, 6, 18, ['#0e1f35', '#122a45', '#17304f'], .3);  // 어두운 남색 바탕, 선은 아주 조금만 밝게
+  const glintTex = rippleTex('#000', 6, 6, 16, ['#4a6f9c', '#6f98c8', '#a8c8f0'], 0);      // 검은 바탕(가산이라 안 보임)에 푸른 흰색 선 몇 개
+  waterTex.repeat.set(2000 / TILE1, 1000 / TILE1);
+  glintTex.repeat.set(2000 / TILE2, 1000 / TILE2);
+  const sea = new THREE.PlaneGeometry(2000, 1000).rotateX(-Math.PI / 2);
+  const water = new THREE.Mesh(sea, basic(0xffffff, { map: waterTex }));
+  water.position.set(0, -4, 300); scene.add(water);
+  const glints = new THREE.Mesh(sea, basic(0xffffff, { map: glintTex, transparent: true, opacity: .5, blending: THREE.AdditiveBlending, depthWrite: false }));
+  glints.position.set(0, -3.98, 300); scene.add(glints);
+  paint(ribbon(shore, shore.map(p => [p[0], 0, -700])), 0x0b0e15);   // 땅: 강기슭 선에서 북쪽 z = -700 까지
+  paint(ribbon(shore, shore.map(p => [p[0], -4, p[2]])), 0x232732);  // 호안: 강기슭 선을 따라 선 벽
+
+  // ---- 2. 한강공원 ----
+  const GRASS = 0x12261b;
+  band(RW + 2, RW + 13, .03, GRASS);        // 잔디 (고속도로 남쪽)
+  band(RW + 6, RW + 7.6, .04, 0x3a3f4b);    // 자전거길
+  band(-(RW + 9), -(RW + 1), .03, GRASS);   // 잔디 (고속도로 북쪽, 음수 거리 = 북쪽)
+  // 램프 구역 안쪽(RW + 1 <= |x| <= RX): z = RZ 선부터 위 북쪽 띠의 북쪽 가장자리까지 잔디로 채운다. 나무는 두지 않음 (램프가 낮게 지나감)
+  for (const sign of [-1, 1]) {
+    const edge = S.map(s => pt(s, -(RW + 9), .03)).filter(p => sign * p[0] >= RW + 1 && sign * p[0] <= RX);
+    paint(ribbon(edge.map(p => [p[0], .03, RZ]), edge), GRASS);
+  }
+  // 공원 가로등: 자전거길을 따라 약 28 간격. 램프 구역은 건너뜀
+  for (let i = 5, step = Math.round(28 * N / hw.getLength()); i <= N; i += step) {
+    const [x, , z] = pt(S[i], RW + 6.8, 0);
+    if (Math.abs(x) < RX) continue;
+    put(.25, 4, .25, x, 2, z, 0x232732);
+    put(.6, .4, .6, x, 4.2, z, 0xeaf2ff);
+    parkGlow.push(glowQuad(10, 10, x, .06, z));
+  }
+
+  // ---- 3. 다리 (마포대교 느낌의 단순한 거더교): 상판, 교각, 난간, 조명 ----
+  // ponytail: 상판은 직선 상자 하나. 강기슭을 2 만큼 땅속으로 파고들게 하고 윗면을 y = -0.01 로 해서 땅과 겹쳐 깜빡이는 것을 피함
+  const bz = shoreZ(0) - 2, BZ = 230, mid = (bz + BZ) / 2, BL = BZ - bz;
+  put(2 * RW + 6, 1.5, BL, 0, -.76, mid, 0x2b303c);          // 상판 (폭 2 * RW + 6 = 차도 2 * RW + 보도 3 x 2)
+  quad(2 * RW, BZ - 200, 0, .02, (200 + BZ) / 2, 0x171a21);  // index.html 의 도로가 끝나는 z = 200 부터 다리 끝까지의 노면
+  for (let z = bz + 20; z < BZ - 4; z += 36) for (const sx of [-(RW - 3), RW - 3]) put(2.4, 3, 3.6, sx, -3, z, 0x232732);  // 교각 (물 밑까지)
+  // 난간과 조명은 강기슭 + 18 부터: 그 앞(z 약 68 ~ 86)은 고속도로 램프가 다리 양옆으로 합류하는 자리라 비워 둔다
+  const rz = shoreZ(0) + 18, BX = RW + 2.75;  // BX: 난간과 조명 기둥의 x (상판 가장자리 안쪽)
+  for (const sx of [-1, 1]) {
+    put(.5, .9, BZ - rz, sx * BX, .45, (rz + BZ) / 2, 0x3a404d);  // 난간
+    // 다리 조명: 18 간격, 양쪽을 반 칸씩 엇갈리게. ponytail: 물 위 반사광은 진짜 반사가 아니라 길쭉한 글로우 면
+    for (let z = rz + (sx < 0 ? 6 : 15); z < BZ - 3; z += 18) {
+      put(.25, 5, .25, sx * BX, 2.5, z, 0x232732);
+      put(.8, .5, .8, sx * BX, 5.2, z, 0xffe2b0);
+      deckGlow.push(glowQuad(8, 12, sx * (RW + 1.2), .06, z));
+      const za = Math.max(z - 13, rz);  // 반사광 면(길이 26)도 난간 시작선 rz 앞으로는 나오지 않게 앞쪽을 자른다
+      reflect.push(glowQuad(8, z + 13 - za, sx * (RW + 6), -3.95, (za + z + 13) / 2));
+    }
+  }
+
+  // ---- 가로수 (InstancedMesh 하나) + 줄기 ----
+  const trees = [];  // { x, z, s }: s 는 크기 배율
+  const ok = (x, z) => !(Math.abs(x) < RX && z > RZ) && z < shoreZ(x);  // 램프 구역과 강 위는 제외
+  for (let t = -192; t <= 192; t += 9) for (const s of [-(RW + 3), RW + 3]) {  // 도로 중심선에서 RW + 3 (보도)
+    if (Math.abs(t) > RC && Math.abs(t - ZB) > RC && ok(s, t)) trees.push({ x: s, z: t, s: 1 });  // 큰길 양옆
+    if (Math.abs(t) > RC && ok(t, s)) trees.push({ x: t, z: s, s: 1 });                           // 길 A
+    if (Math.abs(t) > RC && ok(t, ZB + s)) trees.push({ x: t, z: ZB + s, s: 1 });                 // 길 B
+  }
+  for (let i = 3; i <= N; i += 7) {  // 공원 나무: 자전거길(RW + 6 ~ RW + 7.6) 양쪽, 드문드문
+    const [x, , z] = pt(S[i], rnd() < .5 ? RW + 3.5 + rnd() * 1.5 : RW + 8.5 + rnd() * 2.5, 0);
+    if (rnd() < .7 && Math.abs(x) >= RX) trees.push({ x, z, s: 1 + rnd() * .4 });
+  }
+  const treeMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(2, 2.6, 2).translate(0, 2.8, 0), basic(0xffffff), trees.length);
+  const m4 = new THREE.Matrix4(), c4 = new THREE.Color();
+  trees.forEach((t, i) => {
+    treeMesh.setMatrixAt(i, m4.makeScale(t.s, t.s, t.s).setPosition(t.x, 0, t.z));
+    treeMesh.setColorAt(i, c4.set(pick([0x16321f, 0x12291a, 0x1b3a24, 0x14301d])));  // 화면에 보이는 색(sRGB)으로 고른 어두운 초록 넷
+    put(.4, 1.5 * t.s, .4, t.x, .75 * t.s, t.z, 0x1d1a16);                         // 줄기
+  });
+  scene.add(treeMesh);
+
+  // ---- 4. 건물 ----
+  // 창문 텍스처: 8 x 8 칸, 칸마다 창이 켜졌거나(따뜻한 색, 가끔 푸른색) 꺼졌거나
+  function windowTex(warm, cool, ww, wh) {
+    return canvasTex(64, 64, g => {
+      g.fillStyle = '#10131c'; g.fillRect(0, 0, 64, 64);
+      for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+        const r = rnd();
+        g.fillStyle = r < warm ? (rnd() < .5 ? '#f4c46a' : '#ffe0a0') : r < warm + cool ? '#9fd0ff' : '#0a0c12';
+        g.fillRect(x * 8 + (8 - ww) / 2 | 0, y * 8 + 2, ww, wh);
+      }
+    });
+  }
+  const wallsA = [], wallsB = [];  // 벽 지오메트리: A 는 빌라와 상가 (켜진 창 22%), B 는 아파트 (창이 넓고 55% 켜짐)
+  // 건물 한 채: 벽의 UV 를 크기에 맞게 늘이고(창 한 칸이 cw x ch 유닛) 면마다 무작위로 밀어서 창 무늬가 달라 보이게 한 뒤, 얇은 지붕판을 얹는다.
+  // 지붕 윗면 높이를 돌려준다
+  function building(list, w, h, d, x, z, cw, ch, roofHex) {
+    const g = new THREE.BoxGeometry(w, h, d), uv = g.attributes.uv;
+    for (let f = 0; f < 6; f++) {  // 면 순서: +x, -x, +y, -y, +z, -z (면마다 꼭짓점 4개)
+      const cols = Math.round((f < 2 ? d : w) / cw) / 8, rows = Math.round(h / ch) / 8;
+      const ou = (rnd() * 8 | 0) / 8, ov = (rnd() * 8 | 0) / 8;
+      for (let k = f * 4; k < f * 4 + 4; k++) uv.setXY(k, uv.getX(k) * cols + ou, uv.getY(k) * rows + ov);
+    }
+    list.push(g.translate(x, h / 2, z));
+    put(w + .3, .3, d + .3, x, h + .15, z, roofHex);
+    return h + .3;
+  }
+  // 이 자리(x, z 가 중심, w x d 크기)가 비워야 할 곳과 겹치지 않는지
+  function hwDist(x, z) {  // 고속도로 중심선까지의 거리. 남쪽(강 쪽)이면 음수라서 "RW + 9 이내와 그 남쪽 전부" 가 거리 < RW + 9 하나로 검사됨
+    let best = 1e12, side = 1;
+    for (const s of S) {
+      const d = (s.x - x) ** 2 + (s.z - z) ** 2;
+      if (d < best) { best = d; side = (x - s.x) * s.nx + (z - s.z) * s.nz > 0 ? -1 : 1; }
+    }
+    return Math.sqrt(best) * side;
+  }
+  function free(x, z, w, d) {
+    const x0 = x - w / 2, x1 = x + w / 2, z0 = z - d / 2, z1 = z + d / 2;
+    if (x0 < RC && x1 > -RC) return false;                   // 큰길
+    if (z0 < RC && z1 > -RC) return false;                   // 길 A
+    if (z0 < ZB + RC && z1 > ZB - RC) return false;         // 길 B
+    if (x0 < RX && x1 > -RX && z1 > RZ) return false;      // 램프 구역
+    return [[x, z], [x0, z0], [x1, z0], [x0, z1], [x1, z1]].every(([px, pz]) => hwDist(px, pz) >= RW + 9);
+  }
+
+  // 대로변 상가와 오피스: 큰길 양옆 두 줄 (안쪽 줄은 |x| RW + 9 부터, 바깥 줄은 RW + 23 부터 최대 48 까지)
+  const SIGN = [0xff3b3b, 0x3b8cff, 0x35e07a, 0xffd23a, 0xf2f2ff];  // 빨강 파랑 초록 노랑 흰색
+  for (const sx of [-1, 1]) for (const edge of [RW + 9, RW + 23]) {
+    for (let z = -170; z < 170;) {
+      const w = 9 + rnd() * 4, d = 9 + rnd() * 4, x = sx * (edge + w / 2), zc = z + d / 2;
+      z += d + 1 + rnd() * 2;
+      if (!free(x, zc, w, d)) continue;
+      let h = 10 + rnd() * 14 + Math.max(0, -zc) / 170 * 6;  // 높이 10 ~ 30, 북쪽일수록 조금 더 높게
+      // 교차로에서 RW + 22 이내(건물 모서리 기준)는 12 이하로 낮춰서 교차로가 안 가려지게 함
+      if ([0, ZB].some(c => Math.hypot(Math.max(Math.abs(x) - w / 2, 0), Math.max(Math.abs(zc - c) - d / 2, 0)) < RW + 22)) h = 10 + rnd() * 1.7;
+      const top = building(wallsA, w, h, d, x, zc, 2.4, 3.2, 0x1c202a);
+      if (edge === RW + 9 && rnd() < .5) {  // 큰길 쪽 벽에 세로 간판 (벽에서 큰길 쪽으로 튀어나온 얇은 상자)
+        const sh = 3 + rnd() * 4, by = 3 + rnd() * 3;
+        if (by + sh < h - .5) put(1.2, sh, .4, sx * (RW + 8.5), by + sh / 2, zc + (rnd() - .5) * (d - 3), pick(SIGN));
+      }
+      if (rnd() < .25) put(Math.min(w - 2, 7), 1.8, .5, x, top + .9, zc + d / 2 - .8, pick(SIGN));  // 옥상 간판 (남쪽 가장자리, 카메라 쪽)
+    }
+  }
+
+  // 아파트 단지 3곳 [x0, x1, z0, z1]. 도로와는 10 씩 띄움. 3번 단지의 남쪽 끝은 고속도로 중심선에서 RW + 13 앞
+  // ponytail: 3번 단지는 가장 가까운 지점 기준의 직사각형이라 고속도로가 휘는 만큼 남는 땅이 있고, 줄은 1개만 들어감
+  const zMax3 = Math.min(...S.filter(s => s.x > RX && s.x < 150).map(s => s.z)) - (RW + 13);
+  const complexes = [[-150, -56, ZB + RW + 10, -RW - 10], [56, 150, -150, ZB - RW - 10], [RX, 150, RZ, zMax3]];
+  for (const [x0, x1, z0, z1] of complexes) {
+    quad(x1 - x0, z1 - z0, (x0 + x1) / 2, .03, (z0 + z1) / 2, 0x101c16);  // 단지 바닥: 어두운 초록
+    for (let z = z0 + 4.5; z + 3.5 <= z1; z += 18) {       // 남향 동을 z 방향으로 줄 간격 18 씩
+      for (let x = x0 + 2; ;) {                            // 한 줄 안에서 동을 동서로 늘어놓음
+        const L = 26 + rnd() * 8, h = 20 + rnd() * 14;
+        if (x + L > x1 - 1) break;
+        const top = building(wallsB, L, h, 7, x + L / 2, z, 1.6, 2.6, 0x1e222c);
+        put(4, 2, 4, x + L * (.25 + .5 * rnd()), top + 1, z, 0x2a2e38);  // 옥상 기계실
+        x += L + 5 + rnd() * 2;
+      }
+    }
+  }
+
+  // 주택가(빌라): 10.5 간격 격자에 크기와 위치를 조금씩 흔들어 촘촘하게. 상가 구간(|x| < RW + 37)과 아파트 단지(+2 여유)는 비움
+  const villas = [];
+  for (let gx = -168; gx <= 168; gx += 10.5) for (let gz = -168; gz <= 168; gz += 10.5) {
+    const w = 6 + rnd() * 2.6, d = 6 + rnd() * 2.6, x = gx + (rnd() - .5) * .8, z = gz + (rnd() - .5) * .8;
+    if (rnd() < .08 || (x - w / 2 < RW + 37 && x + w / 2 > -(RW + 37))) continue;
+    if (complexes.some(([a, b, c, e]) => x - w / 2 < b + 2 && x + w / 2 > a - 2 && z - d / 2 < e + 2 && z + d / 2 > c - 2)) continue;
+    if (!free(x, z, w, d)) continue;
+    const h = 4 + rnd() * 4, top = building(wallsA, w, h, d, x, z, 2, 2.5, rnd() < .5 ? 0x1c3d33 : 0x262b36);  // 지붕 절반은 초록 방수 페인트
+    const v = { x, z, top, extra: false };
+    if (rnd() < .25) { put(1.4, 1.2, 1.4, x + w / 2 - 1.3, top + .6, z - d / 2 + 1.3, pick([0x5a5230, 0x2c4a63])); v.extra = true; }  // 물탱크
+    if (rnd() < .2) { put(2.6, 2.2, 2.6, x - w / 2 + 1.8, top + 1.1, z + d / 2 - 1.8, 0x2e323c); v.extra = true; }                    // 옥탑방
+    villas.push(v);
+  }
+  // 교회 십자가: 빌라 옥상 5곳에 짧은 첨탑 + 빨간 네온 십자가 (물탱크와 옥탑방이 없는 집만)
+  // ponytail: 십자가 둘레에 번지는 빛은 없음
+  const near = villas.filter(v => !v.extra && Math.abs(v.x) < 140 && v.z > -140);
+  let crosses = [];
+  for (let tries = 0; tries < 30 && crosses.length < 5; tries++) {  // 무작위로 뽑되 이미 뽑힌 것과 60 이상 떨어진 집만 받는다. 5개가 안 되면 다시 뽑아 가장 많이 뽑힌 조합을 씀
+    const pool = near.slice(), got = [];
+    while (got.length < 5 && pool.length) {
+      const v = pool.splice(rnd() * pool.length | 0, 1)[0];
+      if (got.every(c => Math.hypot(c.x - v.x, c.z - v.z) >= 60)) got.push(v);
+    }
+    if (got.length > crosses.length) crosses = got;
+  }
+  for (const v of crosses) {
+    put(.8, 2, .8, v.x, v.top + 1, v.z, 0x2e323c);
+    put(.5, 3.2, .5, v.x, v.top + 3.6, v.z, 0xff2a2a);
+    put(2, .5, .5, v.x, v.top + 4.3, v.z, 0xff2a2a);
+  }
+
+  // ---- 마무리: 합친 메시를 장면에 붙인다 (물 1 + 물 잔물결 1 + 땅과 소품 1 + 벽 2 + 나무 1 + 글로우 3 = 9 draw call) ----
+  scene.add(new THREE.Mesh(mergeGeometries(solid), basic(0xffffff, { vertexColors: true, side: THREE.DoubleSide })));
+  scene.add(new THREE.Mesh(mergeGeometries(wallsA), basic(0xffffff, { map: windowTex(.22, .08, 4, 5) })));
+  scene.add(new THREE.Mesh(mergeGeometries(wallsB), basic(0xffffff, { map: windowTex(.55, .06, 5, 4) })));
+  for (const [list, color, opacity] of [[parkGlow, 0xcfe0ff, .3], [deckGlow, 0xffd9a0, .35]])
+    scene.add(new THREE.Mesh(mergeGeometries(list), glow(color, opacity)));
+  const reflectMat = glow(0xffd9a0, .3), reflectMesh = new THREE.Mesh(mergeGeometries(reflect), reflectMat);
+  scene.add(reflectMesh);  // 물 위 반사광은 update 에서 살짝 일렁이게 하려고 따로 들고 있음
+
+  // 매 프레임: 오프셋은 무늬 한 장이 1 이라서 유닛 속도를 장 크기로 나눈다. 오프셋이 늘면 무늬가 서쪽(-x)으로 간다.
+  // 반사광은 밝기를 느리게 불규칙하게(주기 약 8초와 5초를 섞음) 흔들고 x 위치를 조금 흔든다
+  return function update(dt, t) {
+    waterTex.offset.x = t * V1 / TILE1 % 1;
+    glintTex.offset.x = t * V2 / TILE2 % 1;
+    reflectMat.opacity = .3 * (1 + .12 * Math.sin(t * .8) + .06 * Math.sin(t * 1.3 + 1));
+    reflectMesh.position.x = .35 * Math.sin(t * .6 + 2);
+  };
+}
+const sceneryUpdate = buildScenery({ THREE, scene, basic, box, flat, glow, canvasTex, mergeGeometries, hw, HY, ZB, LEN, RW });
+
+// ---- 자동차 ----
+const PAINT = [0xb8bec8, 0x2a2e38, 0x7a1c1c, 0x1d3763, 0xc77a1c, 0xd9dde3];  // 도색 색깔
+const TAXI = 4;                                                               // 주황색(인덱스 4)은 택시
+const beam = glow(0xffe9b0, .5);
+// 차 한 대 = 바퀴, 차체, 유리, 지붕, 전조등, 후미등(, 택시등)을 꼭짓점 색을 입혀 하나로 합친 지오메트리. 도색 색깔마다 하나씩 만들어 모든 차가 나눠 쓴다. 앞쪽이 +x 방향
+function carGeo(paint, taxi) {
+  const parts = [];
+  const part = (w, h, d, x, y, z, hex) => {
+    const g = new THREE.BoxGeometry(w, h, d).translate(x, y, z), c = new THREE.Color(hex), col = [];
+    g.deleteAttribute('normal'); g.deleteAttribute('uv');  // 합치려면 속성 구성이 같아야 해서 색 외에는 지운다
+    for (let i = 0; i < g.attributes.position.count; i++) col.push(c.r, c.g, c.b);
+    g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    parts.push(g);
+  };
+  for (const x of [-1.3, 1.3]) part(.9, .7, 2.3, x, .35, 0, 0x040506);  // 바퀴 (좌우가 한 덩어리, 옆으로 살짝 튀어나옴)
+  part(4.2, .7, 1.9, 0, .75, 0, paint);                                   // 차체
+  part(2.2, .6, 1.7, -.25, 1.4, 0, 0x0d1118);                             // 유리창
+  part(1.4, .12, 1.5, -.25, 1.76, 0, paint);                              // 지붕 (앞뒤로 유리가 남아 보임)
+  for (const z of [-.65, .65]) {
+    part(.4, .6, .5, 1.95, .85, z, 0xfff1c4);                             // 전조등
+    part(.3, .6, .5, -2, .85, z, 0xff2a2a);                               // 후미등
+  }
+  if (taxi) part(.4, .25, .9, -.25, 1.95, 0, 0xfff6a0);                   // 택시 표시등
+  return mergeGeometries(parts);
+}
+const carMat = basic(0xffffff, { vertexColors: true }), carGeos = PAINT.map((c, i) => carGeo(c, i === TAXI));
+const beamGeo = new THREE.PlaneGeometry(9, 5).rotateX(-Math.PI / 2);  // 바닥에 비친 불빛
+// 깜빡이: 왼쪽용과 오른쪽용을 따로, 각각 앞 모서리와 뒤 모서리의 작은 주황 상자 2개를 합침 (차체 위에 얹어서 위에서도 보임). 재질은 모두 공유하고 visible 로 켜고 끔
+const blinkMat = basic(0xffa81f);
+const blinkGeos = [-1, 1].map(side => mergeGeometries([1.55, -1.6].map(x => new THREE.BoxGeometry(.5, .3, .5).translate(x, 1.25, side * .7))));
+function makeCar() {  // 차 한 대 = 합친 차체 메시 1 + 바닥 불빛 면 1 + 깜빡이 메시 2. ph 는 깜빡이 박자를 차마다 어긋나게 함
+  const g = new THREE.Group(), b = new THREE.Mesh(beamGeo, beam);
+  b.position.set(6.5, .08, 0);
+  const bl = new THREE.Mesh(blinkGeos[0], blinkMat), br = new THREE.Mesh(blinkGeos[1], blinkMat);
+  bl.visible = br.visible = false;
+  g.add(new THREE.Mesh(carGeos[Math.random() * PAINT.length | 0], carMat), b, bl, br);
+  scene.add(g); return { g, bl, br, ph: Math.random() * .7 };
+}
+const cars = [];
+// 차로 = (도로, 진행 방향 h, 안쪽부터 k=0,1,2). 차로마다 원점 O 가 있고 위치는 O + f*s + r*off (f 진행 방향, r 오른쪽).
+// nodes 는 이 차로가 지나는 교차로와, 차로 좌표 s 로 본 그 위치 x. x 오름차순이라 앞쪽부터 만나는 순서
+// w 는 차로 끝에 닿은 차가 이 차로의 처음으로 다시 들어올 가중치 (큰길 남행, 북행에 많이 주고, 길 A 는 W_A, 길 B 는 W_B 씩. 방향 안에서 k=0,1,2 는 W_K 비율)
+// 길 B 를 길 A 보다 많이 주는 것은 위쪽 교차로(노드 1)에서 동서로 지나는 차가 눈에 띄게 하려는 것. 더 늘리면 동서 초록 7초로는 다 못 빠져서 길 B 에 줄만 길어짐
+// 남행이 북행보다 큰 것은 남행 차가 다리에 닿기 전에 교차로 2곳과 램프 R2 에서 빠져나가기 때문 (북행은 다리에서 바로 들어옴)
+// 큰길은 1차로(좌회전)를 1:4:4 로 줄임: 좌회전 화살표가 짧아서 2:4:4 면 좌회전 줄이 다리와 지도 끝까지 밀림
+const W_BIG = [50, 40], W_A = [4, 4], W_B = [12, 12], W_K = [2, 4, 4], W_K_BIG = [1, 4, 4];
+const lanes = [];
+for (const [ox, oz, hs, ni, ws, wk] of [[0, 0, [1, 3], [0, 1], W_BIG, W_K_BIG], [0, 0, [0, 2], [0], W_A, W_K], [0, ZB, [0, 2], [1], W_B, W_K]])  // 큰길, 길 A, 길 B
+  hs.forEach((h, hi) => { for (const k of [0, 1, 2]) {
+    const nl = ni.map(i => ({ node: nodes[i], x: (nodes[i].x - ox) * DIRS[h][0] + (nodes[i].z - oz) * DIRS[h][1] }));
+    lanes.push({ id: lanes.length, ox, oz, h, k, off: 2 + 4 * k, w: ws[hi] * wk[k], nodes: nl.sort((a, b) => a.x - b.x) });
+  } });
+let laneCount = lanes.length;  // 차로 번호: 지상 차로는 lanes 의 번호, 고속도로 차로는 그 뒤부터
+const laneLen = id => id < lanes.length ? LEN : HLEN;  // 차로 길이 (차로 끝에서 이어지는 것을 모듈로로 셀 때 씀)
+// 고속도로 차로 기록 {id, dir, off, k}: 방향당 3차로 (off 는 dir * 2, 6, 10). hwOuter 는 dir 별 바깥 차로 번호
+const hwl = [], hwOuter = {};
+for (const dir of [1, -1]) for (const k of [0, 1, 2]) { hwl.push({ id: laneCount, dir, off: dir * (2 + 4 * k), k }); if (k === 2) hwOuter[dir] = laneCount; laneCount++; }
+// 양옆 차로 nb = [왼쪽(k-1), 오른쪽(k+1)] 의 차로 번호, 없으면 null. 차선 변경이 쓴다
+for (const ln of [...lanes, ...hwl]) ln.nb = [-1, 1].map(dk => {
+  const o = ln.dir ? hwl.find(l => l.dir === ln.dir && l.k === ln.k + dk) : lanes.find(l => l.ox === ln.ox && l.oz === ln.oz && l.h === ln.h && l.k === ln.k + dk);
+  return o ? o.id : null;
+});
+const laneInfo = id => id < lanes.length ? lanes[id] : hwl[id - lanes.length];
+// 램프가 이어 주는 차로: fl/fx 출발 차로와 그 차로 좌표, tl/tx 도착 차로와 좌표, toHw 고속도로로 들어가는 진입 램프인지, p 진출 확률.
+// gd/wd 는 램프가 차로 옆 3.2 이내로 붙어 있는 구간 길이(그림을 재서 정함): 출발 쪽 gd 동안은 출발 차로에, 도착 쪽 wd 동안은 도착 차로에 있는 것으로 치고, 합류 대기점은 끝에서 wd-2 앞.
+// 고속도로 차로 좌표는 s = dir*(a - HLEN/2) (a 는 중심선 위 호 길이 위치). 램프는 큰길 바깥 차로(k=2)에 붙는다
+// p 는 고속도로 차 수가 처음(48대) 근처로 유지되게 맞춘 값. R3 은 다리 위 남행으로 내리므로 높게, R2 는 남행 차가 다리 앞에서 빠지므로 낮게.
+// R4 는 북행 차가 다리를 거의 다 건넌 뒤(z=98)에 빠지므로 높여도 다리 위 차는 거의 안 줄어서, R3 과 함께 높여 고속도로 차 수를 맞춤
+const bigS = lanes.find(l => l.h === 1 && l.k === 2), bigN = lanes.find(l => l.h === 3 && l.k === 2);  // 큰길 남행, 북행 바깥 차로
+const aE = hwAt(84, 0, HY).a, aW = hwAt(-84, 0, HY).a, hwCoord = (dir, a) => dir * (a - HLEN / 2);
+Object.assign(ramps[0], { fl: hwOuter[-1], fx: hwCoord(-1, aE), tl: bigN.id, tx: -26, toHw: false, gd: 24, wd: 18, p: .12 });
+Object.assign(ramps[1], { fl: bigS.id, fx: 20, tl: hwOuter[-1], tx: hwCoord(-1, aW), toHw: true, dir: -1, off: -10, gd: 14, wd: 27, p: .2 });
+Object.assign(ramps[2], { fl: hwOuter[1], fx: hwCoord(1, aW), tl: bigS.id, tx: 98, toHw: false, gd: 24, wd: 18, p: .38 });
+Object.assign(ramps[3], { fl: bigN.id, fx: -98, tl: hwOuter[1], tx: hwCoord(1, aE), toHw: true, dir: 1, off: 10, gd: 15, wd: 27, p: .48 });
+const rampFrom = [];  // 차로 번호 > 그 차로에서 출발하는 램프
+for (const r of ramps) rampFrom[r.fl] = r;
+const RAMP_V = 12;    // 램프 속도 상한
+const HW_V = 30;      // 고속도로 기준 속도 (차마다 0.8 ~ 1.2 배). 램프로 올라온 차도 같은 기준. 합류 확인 구간, 가속 구간 상한, 차선 변경 빈자리는 이 속도에 맞춰 잡은 값
+const LC_SIG = 1.2, LC_MOVE = 1.8;  // 차선 변경: 깜빡이만 켜고 달리는 예고 시간, 옆으로 옮겨 가는 시간 (초)
+
+// 지상 차 한 대의 정보: lane 차로 번호, h 진행 방향, k 차로(0 안쪽 off 2 = 좌회전 전용, 1 가운데 off 6 = 직진 전용, 2 바깥쪽 off 10 = 직진 또는 우회전),
+// s 차로 원점 기준 진행 거리, nd/x 다음에 만날 교차로와 차로 좌표로 본 그 위치, mv 거기서 할 움직임('L' 좌회전, 'S' 직진, 'R' 우회전),
+// turning 이면 s 대신 d(회전 호를 따라 간 거리)로 움직임. nh/dl/xd 는 회전 뒤의 방향, 차로 번호, 그 차로에서 본 교차로 위치. R/arc 는 회전 반지름과 호 길이
+// take 는 앞에서 탈 램프(없으면 null), rp/rd 는 지금 타고 있는 램프와 그 위에서 간 거리 (램프 위에서는 s 대신 rd 로 움직임)
+// lc 는 차선 변경 중인 기록 {to 옮겨 갈 차로, dk -1 왼쪽 +1 오른쪽, ph 0 예고 1 이동, t 이 단계 경과 시간, off1 옮겨 갈 차로의 off} (없으면 null)
+function pick(c) {  // 이 차로에서 앞에 남은 다음 교차로를 찾고, 거기서 할 움직임을 새로 정한다
+  const lim = c.take ? c.take.fx : Infinity;  // 램프를 탈 차는 램프 출발점 뒤의 교차로는 안 만남
+  const hit = lanes[c.lane].nodes.find(m => m.x - E > c.s && m.x < lim);  // x 오름차순이라 처음 걸리는 것이 다음 교차로
+  c.nd = hit ? hit.node : null; c.x = hit ? hit.x : Infinity;
+  c.mv = !hit || c.take ? 'S' : c.k === 0 ? 'L' : c.k === 1 ? 'S' : Math.random() < .6 ? 'S' : 'R';  // 남은 교차로가 없거나 램프를 탈 거면 직진 (바깥 차로뿐)
+  if (c.mv === 'S') return;
+  c.R = c.mv === 'R' ? E - c.off : E + c.off; c.arc = c.R * Math.PI / 2;
+  c.nh = (c.h + (c.mv === 'R' ? 1 : 3)) % 4;
+  const to = lanes.find(l => l.h === c.nh && l.k === c.k && l.nodes.some(m => m.node === c.nd));  // 그 교차로를 지나는, 방향 nh, 같은 k 의 차로
+  c.dl = to.id; c.xd = to.nodes.find(m => m.node === c.nd).x;
+}
+function enter(c) {  // 새 차로에 들어왔을 때(처음 배치, 차로 끝에서 돌아옴, 회전이나 램프로 합류, 차선 변경): 램프 출발점이 앞에 있으면 확률 p 로 탈지 정하고, 지상 차는 다음 교차로도 고름
+  const r = rampFrom[c.lane];
+  c.take = r && r.fx > c.s && Math.random() < r.p ? r : null;
+  if (c.axis !== 'h') pick(c);
+}
+function addRoad(ln, n) {  // 차로 하나에 차를 n 대 놓는다
+  const placed = [];
+  for (let i = 0; i < n; i++) {
+    const v = 14 * (.8 + Math.random() * .4);
+    // 아무 데나 놓되, 교차로에서 E+8 안쪽과 같은 차로의 다른 차에서 gap 안쪽은 피함 (차로 끝과 처음은 이어진 것으로 계산).
+    // 무작위로 놓다 보면 길이가 남아도 30 짜리 빈칸이 없어질 수 있어서, 500번 실패하면 간격을 12 로 줄임 (안 줄이면 페이지가 멈춤)
+    let s, tries = 0, gap;
+    do { s = (Math.random() - .5) * LEN; gap = ++tries < 500 ? 30 : 12; }
+    while (ln.nodes.some(m => Math.abs(s - m.x) < E + 8) || placed.some(p => Math.min(Math.abs(p - s), LEN - Math.abs(p - s)) < gap));
+    placed.push(s);
+    const c = { ...makeCar(), id: cars.length, h: ln.h, k: ln.k, off: ln.off, lane: ln.id, len: LEN, v, vmax: v, s, turning: false, d: 0, lc: null };
+    enter(c); cars.push(c);
+  }
+}
+for (const ln of lanes) addRoad(ln, 4 + ln.k + (ln.h % 2 ? 1 : ln.oz === ZB ? 2 : 0));  // 차로당 k=0 4대, k=1 5대, k=2 6대에 큰길은 1대, 길 B 는 2대 더 (지상 108대)
+
+// 고속도로 차: axis 'h' / dir: 방향(+1, -1) / off: 중심선에서 차선까지 거리
+function addHw(ln, n, vmax) {
+  for (let i = 0; i < n; i++) {
+    const v = vmax * (.8 + Math.random() * .4);
+    const c = { ...makeCar(), id: cars.length, axis: 'h', dir: ln.dir, k: ln.k, off: ln.off, lane: ln.id, len: HLEN, v, vmax: v, s: -HLEN / 2 + (i + Math.random() * .5) * HLEN / n, lc: null };
+    enter(c); cars.push(c);
+  }
+}
+// 우측통행: 진행 방향의 오른쪽 차선에 배치
+for (const ln of hwl) addHw(ln, 8, HW_V);  // 고속도로는 신호 없이 빠르게. 차로당 8대
+
+// 차선 변경 중이면 지금 옆 위치(off)와 옆으로 향한 각도(오른쪽이 +): off 를 코사인으로 부드럽게 옮기고, 옆으로 가는 속도와 앞으로 가는 속도로 각도를 구함
+function lcPose(c) {
+  const l = c.lc, u = Math.min(l.t / LC_MOVE, 1), dOff = l.off1 - c.off;
+  return { off: c.off + dOff * (1 - Math.cos(Math.PI * u)) / 2, th: Math.atan2(dOff * (c.axis === 'h' ? c.dir : 1) * Math.PI / 2 * Math.sin(Math.PI * u) / LC_MOVE, Math.max(c.v, 1)) };
+}
+// 차를 자기 위치에 놓는다. 지상 차는 앞쪽 좌표 a, 오른쪽 좌표 b 를 구해서 O + f*a + r*b 로 놓는다
+function place(c) {
+  if (c.rp) {  // 램프 위: 곡선의 점과 접선 방향 (차는 수평으로 둠)
+    const u = Math.min(c.rd / c.rp.len, 1);
+    c.rp.curve.getPointAt(u, P); c.rp.curve.getTangentAt(u, T);
+    c.g.position.set(P.x, P.y, P.z); c.g.rotation.y = Math.atan2(-T.z, T.x);
+    return;
+  }
+  const lp = c.lc && c.lc.ph ? lcPose(c) : null;
+  if (c.axis === 'h') {  // 고속도로: 곡선 위의 점과 진행 방향을 구해서, 그 옆 차선에 방향을 맞춰 놓는다
+    const u = c.dir * c.s / HLEN + .5, off = lp ? lp.off : c.off;
+    hw.getPointAt(u, P); hw.getTangentAt(u, T);
+    c.g.position.set(P.x - T.z * off, HY, P.z + T.x * off);
+    c.g.rotation.y = Math.atan2(-T.z * c.dir, T.x * c.dir) - (lp ? lp.th : 0);
+    return;
+  }
+  const ln = lanes[c.lane], [fx, fz] = DIRS[c.h], [rx, rz] = DIRS[(c.h + 1) % 4];  // f 진행 방향, r 오른쪽
+  let sg = c.mv === 'R' ? 1 : -1;  // 회전 중심은 우회전이면 오른쪽(+r), 좌회전이면 왼쪽(-r)
+  let a = c.s, b = c.off, cos = 1, sin = 0;  // 직진이면 자기 차로 위, 진행 방향은 f 그대로
+  if (c.turning) {  // 사분원: 회전 시작점 (x-E, off) 에서 중심 쪽으로 휘어 간다. phi 는 호를 따라 돈 각도
+    const phi = c.d / c.R; cos = Math.cos(phi); sin = Math.sin(phi);
+    a = c.x - E + c.R * sin; b = c.off + sg * c.R * (1 - cos);
+  } else if (lp) { b = lp.off; sg = 1; cos = Math.cos(lp.th); sin = Math.sin(lp.th); }  // 차선 변경 중: 진행 방향이 f 에서 r 쪽으로 th 만큼 기욺
+  c.g.position.set(ln.ox + fx * a + rx * b, 0, ln.oz + fz * a + rz * b);
+  c.g.rotation.y = Math.atan2(-(fz * cos + sg * rz * sin), fx * cos + sg * rx * sin);  // 진행 방향 = f*cos + n*sin
+}
+
+// ---- 매 프레임: 신호 바꾸고 차 움직이기 ----
+function phase(seq, u) {  // 축의 순서(SEQ)가 시작하고 u초 뒤의 상태
+  for (const [name, secs] of seq) { if (u < secs) return name; u -= secs; }
+  return 'R';
+}
+const GO = { L: ['L', 'LY'], S: ['G', 'GY'] };  // 좌회전과 직진이 허용되는 자기 축의 신호 상태
+const TURN_V = { L: 9, R: 5 };                   // 회전 중 속도 상한
+const LIT = { R: [1, 0, 0, 0], L: [1, 0, 1, 0], LY: [0, 1, 0, 0], G: [0, 0, 0, 1], GY: [0, 1, 0, 0] };  // 상태별로 켜지는 렌즈 (빨강, 노랑, 화살표, 초록)
+const GLOW = { R: LENS[0], L: LENS[3], LY: LENS[1], G: LENS[3], GY: LENS[1] };  // 상태별 바닥 번짐 색
+const lcDone = { g: 0, h: 0 };  // 마친 차선 변경 횟수: 지상, 고속도로 (check() 가 확인)
+
+// o 가 차로 L 위에 있는 좌표. 그 차로에 없으면 null
+// 회전 중인 o 는 출발 차로(x-E+d)와 목적 차로(xd+E-호길이+d) 양쪽에 있는 것으로 친다 (유령 좌표)
+// 차선 변경으로 옆으로 옮겨 가는 중인 o 는 원래 차로와 옮겨 갈 차로 양쪽에 같은 좌표로 있다
+// 램프 위의 o 는 d<gd 인 동안만 출발 차로에(출발 좌표+d), 남은 거리<wd 인 동안만 도착 차로에(도착 좌표-남은 거리) 있는 것으로 친다.
+// 단 고속도로로 들어가는 램프가 대기점에서 서 있는 동안(hold)은 도착 차로에 없는 것으로 침: 합류 구간이 고속도로 쪽으로 50 이나 뒤라서, 있는 것으로 치면 뒤차가 구간 안에 갇혀 서로 기다림.
+// 지상으로 나오는 램프는 서 있어도 있는 것으로 쳐서 자리를 맡음: 교차로 대기 줄이 끊기지 않아 합류 구간이 영영 안 비는 것을 막음
+function coord(o, L) {
+  if (o.rp) {
+    const r = o.rp, rem = r.len - o.rd;
+    return r.fl === L && o.rd < r.gd ? r.fx + o.rd : r.tl === L && rem < r.wd && !(o.hold && r.toHw) ? r.tx - rem : null;
+  }
+  if (!o.turning) return o.lane === L || (o.lc && o.lc.ph && o.lc.to === L) ? o.s : null;
+  return o.lane === L ? o.x - E + o.d : o.dl === L ? o.xd + E - o.arc + o.d : null;
+}
+// o 가 "차로 L 의 좌표 sc" 보다 앞으로 얼마나 떨어져 있는지. 그 차로에 없으면 Infinity. 차로 끝에서 이어지는 것은 모듈로
+// 묻는 차(me)와 좌표가 거의 같으면 번호(id)가 작은 쪽이 앞에 있는 것으로 쳐서, 둘이 서로 앞차라며 영영 멈추는 교착을 막는다 (같은 앞차를 같은 간격으로 따라 서면 좌표가 똑같아질 수 있음)
+function gapTo(o, L, sc, len, me) {
+  const q = coord(o, L);
+  if (q === null) return Infinity;
+  const g = (q - sc + len) % len;
+  return g < .02 || g > len - .02 ? (o.id < me.id ? .02 : len - .02) : g;
+}
+
+// 꼬리물기 방지: 내가 빠져나갈 차로(직진은 자기 차로, 회전은 목적 차로)의 교차로 출구 구간(교차로 중심 기준 -E ~ E+8)이 막혔는지.
+// 거의 선 차(v<3)가 있으면 막힌 것. 우회전은 회전 중이 아닌 차가 속도와 상관없이 하나라도 있으면 막힌 것 (합류가 교차로 안의 직진 차를 세우지 않게)
+// 목적 차로 정지선에서 기다리는 차는 x-18 근처라 이 구간 밖
+function jammed(c) {
+  const turn = c.mv !== 'S', L = turn ? c.dl : c.lane, xn = turn ? c.xd : c.x;
+  for (const o of cars) {
+    const q = o === c ? null : coord(o, L);
+    if (q !== null && q > xn - E && q < xn + E + 8 && (o.v < 3 || (c.mv === 'R' && !o.turning))) return true;
+  }
+  return false;
+}
+// 교차로 점유: 다른 축(가로지르는 방향)의 차가 아직 교차로 안(회전 중이거나 중심에서 E 이내)에 있는지.
+// 노랑에 들어와 출구가 밀려 천천히 빠져나가는 차가 있으면 전체 빨강 2초가 지나도 남아 있어서, 다음 신호의 차가 정지선에서 기다린다.
+// 우회전 차는 모퉁이만 돌아 바깥 차로로 들어가서 다른 차의 길과 겹치지 않으므로 뺀다 (빼지 않으면 신호 없이 계속 도는 우회전 차 때문에 좌회전 화살표를 못 씀)
+function boxBusy(c) {
+  return cars.some(o => o !== c && o.nd === c.nd && o.mv !== 'R' && o.h % 2 !== c.h % 2 && (o.turning || Math.abs(o.s - o.x) < E));
+}
+
+// 램프 끝의 합류 구간이 막혔는지: 도착 차로 좌표로 tx-12 ~ tx+6 (고속도로면 tx-50 ~ tx+10)에 램프 차가 아닌 차가 있으면 막힌 것
+function merging(r) {
+  const lo = r.tx - (r.toHw ? 50 : 12), hi = r.tx + (r.toHw ? 10 : 6);
+  return cars.some(o => { const q = o.rp ? null : coord(o, r.tl); return q !== null && q > lo && q < hi; });
+}
+// ponytail: 램프는 1차로. 합류 양보는 대기점에서 그 순간 구간을 한 번 보는 것뿐이라 (고속도로 쪽 50 은 속도 30 기준), 고속도로 차가 더 빨라지거나 합류가 잦으면 구간을 넓히고 가속 차로를 따로 둠
+// ponytail: 램프 차와 차로 차의 충돌은 유령 좌표로만 피함. gd/wd 는 지금 램프 곡선에서 잰 값이라 램프 점을 옮기면 다시 재야 함
+// ponytail: 출발 차로의 대기 줄이 램프 출발점까지 밀리면 램프를 탈 차도 그 줄에 서서 기다림 (램프로 새서 줄을 건너뛰지 않음)
+// 램프 위의 차 한 대를 움직인다: 같은 램프의 앞차와 (처음 gd 안이면) 출발 차로의 앞차, (끝 wd 안이면) 도착 차로의 앞차를 따라가고, 대기점(끝에서 wd-2 앞)에서 합류 구간이 막혔으면 선다
+function stepRamp(c, dt) {
+  const r = c.rp, rem = r.len - c.rd, wp = r.len - r.wd + 2;  // 대기점은 유령 범위(wd) 안쪽 2 지점이라, 서 있는 동안에도 유령이 켜짐
+  let d = Infinity, cap = r.toHw && rem < 55 ? 25 : RAMP_V;  // 진입 램프의 마지막 55 는 고속도로와 나란한 가속 구간
+  for (const o of cars) if (o !== c) {
+    if (o.rp === r && o.rd > c.rd) d = Math.min(d, o.rd - c.rd - 6);
+    if (c.rd < r.gd) d = Math.min(d, gapTo(o, r.fl, r.fx + c.rd, laneLen(r.fl), c) - 6);  // 아직 출발 차로 옆이면 그 차로의 앞차도 봄
+    if (rem < r.wd) d = Math.min(d, gapTo(o, r.tl, r.tx - rem, laneLen(r.tl), c) - 6);
+  }
+  c.hold = c.rd > wp - 40 && (c.rd <= wp || c.rd + c.v / 5 < wp + 1.5) && merging(r);  // 정지선과 같은 방식 (대기점을 이미 지난 차는 그대로 감)
+  if (c.hold) d = Math.min(d, wp - c.rd);
+  const want = Math.max(0, Math.min(cap, d));
+  c.v += Math.min((want - c.v) * Math.min(1, dt * 5), 6 * dt);
+  c.rd += c.v * dt;
+  if (c.rd >= r.len) {  // 끝에 닿음: 도착 차로의 차가 된다
+    r.done++;
+    c.s = r.tx + c.rd - r.len; c.lane = r.tl; c.rp = null; c.hold = false;
+    if (r.toHw) { c.axis = 'h'; c.dir = r.dir; c.k = 2; c.off = r.off; c.len = HLEN; c.vmax = HW_V * (.8 + Math.random() * .4); }
+    else { const ln = lanes[r.tl]; c.axis = null; c.h = ln.h; c.k = ln.k; c.off = ln.off; c.len = LEN; c.vmax = 14 * (.8 + Math.random() * .4); }
+    enter(c);
+  }
+}
+
+// ---- 차선 변경 ----
+// ponytail: 차선 변경은 직선 구간에서만 (교차로 정지선 45 앞부터, 교차로 중심 지나 E+10 까지, 램프가 붙는 지점 35(고속도로는 56) 이내는 안 함). 막히면 그냥 포기하고 다음 기회를 기다림. 양보나 끼어들기 협상은 없음
+const rampNear = (lane, s, range) => ramps.some(r => (r.fl === lane && Math.abs(r.fx - s) < range) || (r.tl === lane && Math.abs(r.tx - s) < range));
+// 옮겨 갈 차로 to 에서 c 의 좌표 기준 (뒤 back, 앞 front) 구간에 다른 차가 없는지 (유령 좌표 포함)
+function roomIn(c, to, back, front) {
+  for (const o of cars) {
+    const q = o === c ? null : coord(o, to);
+    if (q !== null && q > c.s - back && q < c.s + front) return false;
+  }
+  return true;
+}
+// c 가 옆 차로 to 로 바꿀 수 있는 상태인지. nearStop 은 지상 차가 다음 정지선까지 이만큼은 남아야 한다는 거리 (예고 시작 때 45, 이동 시작 때 25)
+function canChange(c, to, nearStop) {
+  const hw = c.axis === 'h', range = hw ? 56 : 35;
+  if (c.v < 3 || c.turning || c.rp || c.take) return false;
+  if (rampNear(c.lane, c.s, range) || rampNear(to, c.s, range)) return false;
+  if (!hw && ((c.nd && c.x + STOP - c.s < nearStop) || lanes[c.lane].nodes.some(m => c.s > m.x && c.s - m.x < E + 10))) return false;
+  return roomIn(c, to, hw ? 22 : 12, hw ? 15 : 9);
+}
+// 차선 변경을 시작할지 매 프레임 확률로 정한다. ld/lg 는 앞차와 그 차까지의 간격
+// 추월: 앞차가 14 이내에서 내 vmax 보다 3 이상 느리면 초당 .25 (옆 차로 앞 25 이내가 비어 있어야 함). 가끔: 초당 .008 (약 2분에 한 번)
+function tryLC(c, dt, ld, lg) {
+  const slow = ld && lg < 14 && ld.v < c.vmax - 3;
+  if (Math.random() >= (slow ? .258 : .008) * dt) return;
+  const sides = laneInfo(c.lane).nb.map((to, i) => [to, i]).filter(([to]) => to !== null && canChange(c, to, 45) && (!slow || roomIn(c, to, 0, 25)));
+  if (!sides.length) return;
+  const [to, i] = sides[Math.random() * sides.length | 0];
+  c.lc = { to, dk: i ? 1 : -1, ph: 0, t: 0, off1: laneInfo(to).off };
+}
+
+// 깜빡이: 차선 변경(예고와 이동), 회전 시작점 40 앞부터 회전이 끝날 때까지, 램프 진출(출발점 50 앞부터 램프 앞부분까지, 오른쪽), 램프 끝 합류 구간(왼쪽)
+const blinkSide = c => {  // -1 왼쪽, +1 오른쪽, 0 꺼짐
+  if (c.lc) return c.lc.dk;
+  if (c.rp) return c.rd < c.rp.gd ? 1 : c.rp.len - c.rd < c.rp.wd ? -1 : 0;
+  if (c.take && c.take.fx - c.s < 50) return 1;
+  if (c.axis !== 'h' && c.mv !== 'S' && c.nd && (c.turning || c.s > c.x - E - 40)) return c.mv === 'L' ? -1 : 1;
+  return 0;
+};
+function blinker(c, t) {  // 약 .35초 켜지고 .35초 꺼짐. 차마다 박자가 어긋나게 ph 를 더함
+  const sd = blinkSide(c), on = (t + c.ph) % .7 < .35;
+  c.bl.visible = sd < 0 && on; c.br.visible = sd > 0 && on;
+}
+
+// 차로 끝에 닿은 지상 차가 다시 들어올 차로를 가중치(lane.w)로 고른다. 그 차로의 처음 14 구간에 차가 있으면 다른 차로를 고르고, 전부 막혀 있으면 자기 차로
+function reenterLane(c) {
+  const pool = lanes.slice();
+  while (pool.length) {
+    let r = Math.random() * pool.reduce((a, l) => a + l.w, 0), i = 0;
+    while (i < pool.length - 1 && r >= pool[i].w) r -= pool[i++].w;
+    const ln = pool.splice(i, 1)[0];
+    if (!cars.some(o => { const q = o === c ? null : coord(o, ln.id); return q !== null && q < -LEN / 2 + 14; })) return ln;
+  }
+  return lanes[c.lane];
+}
+
+// 차는 차로 끝에 닿으면 (지상 차는 가중치로 고른) 차로의 처음으로 돌아가고, 교차로를 지날 때마다 앞에 남은 다음 교차로에서 할 움직임을 새로 정한다.
+// ponytail: 차선 변경은 위 절 참고. 빨간불 우회전 때 일시정지 생략. 보행자 신호 없음. U턴 없음.
+// ponytail: 교차로 안에서 경로가 서로 가로지르는 차끼리는 안 봄. 신호 시간차(전체 빨강 2초)와, 들어가기 전 정지선에서 보는 교차로 점유(boxBusy)로만 충돌을 피함
+// ponytail: 꼬리물기 방지는 정지선 앞에서 출구 구간만 봄. 출구가 막힌 채 이미 선을 넘은 차는 못 되돌림. 교차로 간격 80 이 넘치면 구간을 넓힘
+function step(dt, t) {
+  // 신호: 노드마다 따로. 주기 CYCLE 초 중 앞 TX 초는 동서 축(x)이 순서를 한 바퀴 돌고 남북 축은 빨강, 나머지는 반대
+  for (const n of nodes) {
+    const u = (t + n.off) % CYCLE;
+    n.st = { x: u < TX ? phase(SEQ.x, u) : 'R', z: u < TX ? 'R' : phase(SEQ.z, u - TX) };
+    for (const a of ['x', 'z']) {
+      LIT[n.st[a]].forEach((on, i) => n.lens[a][i].color.set(LENS[i]).multiplyScalar(on ? 1 : .05));  // 꺼진 렌즈는 같은 색을 어둡게
+      n.glow[a].color.set(GLOW[n.st[a]]);
+    }
+  }
+  for (const c of cars) {
+    if (c.rp) { stepRamp(c, dt); place(c); blinker(c, t); continue; }
+    const gnd = c.axis !== 'h';       // 지상 차만 신호를 보고 회전함
+    let d = Infinity, cap = c.vmax;  // d: 앞을 막는 것(정지선, 앞차)까지 남은 거리 / cap: 속도 상한
+    if (c.take) cap = Math.min(cap, RAMP_V + c.take.fx - c.s);  // 램프를 탈 차는 출발점에 닿기 전에 미리 감속
+    if (gnd && c.turning) cap = Math.min(cap, TURN_V[c.mv]);
+    else if (gnd && c.nd) {  // 앞에 교차로가 남아 있으면 그 교차로의 신호를 본다. 위치는 전부 그 교차로의 차로 좌표 c.x 기준
+      const st = c.nd.st, own = c.h % 2 ? 'z' : 'x', cross = c.h % 2 ? 'x' : 'z', stop = c.x + STOP;
+      // 우회전은 교차하는 축의 직진이 멈춰 있을 때, 좌회전과 직진은 자기 축 신호가 맞을 때 간다
+      let go = c.mv === 'R' ? !GO.S.includes(st[cross]) : GO[c.mv].includes(st[own]);
+      if (go && c.s > stop - 40 && c.s <= stop + 1.5) go = !jammed(c) && !boxBusy(c);  // 신호가 허용해도 출구가 막혔거나 가로지르는 차가 교차로에 남아 있으면 정지선에서 기다림
+      // 허용 안 되면 정지선에서 섬. 선을 이미 지난 차는 그대로 가지만, 브레이크로 선 근처(1.5 안)에 설 수 있는 차(v/5 가 제동 거리)는 계속 섬
+      if (!go && (c.s <= stop || c.s + c.v / 5 < stop + 1.5)) d = stop - c.s;
+      if (c.mv !== 'S' && c.s < c.x - E) cap = Math.min(cap, TURN_V[c.mv] + (c.x - E - c.s));  // 회전 시작점에 닿기 전에 미리 감속
+    }
+    const L = c.turning ? c.dl : c.lane, sc = c.turning ? c.xd + E - c.arc + c.d : c.s;  // 회전 중이면 목적 차로 기준
+    let ld = null, lg = Infinity;  // 가장 가까운 앞차와 그 간격 (차선 변경 판단용)
+    for (const o of cars) if (o !== c) { const g = gapTo(o, L, sc, c.len, c); if (g < lg) { lg = g; ld = o; } d = Math.min(d, g - 6); }
+    if (c.lc && c.lc.ph) for (const o of cars) if (o !== c) d = Math.min(d, gapTo(o, c.lc.to, sc, c.len, c) - 6);  // 옆으로 옮겨 가는 중이면 옮겨 갈 차로의 앞차도 봄
+    const want = Math.max(0, Math.min(cap, d));  // 남은 거리가 줄수록 느리게
+    c.v += Math.min((want - c.v) * Math.min(1, dt * 5), 6 * dt);  // 감속은 바로, 가속은 천천히
+    if (c.turning) {  // 호를 따라 가다가, 끝에 닿으면 목적 차로에서 그 교차로의 +E 지점에 합류
+      c.d += c.v * dt;
+      if (c.d >= c.arc) {
+        c.nd.done[c.mv]++;
+        c.s = c.xd + E + c.d - c.arc; c.h = c.nh; c.lane = c.dl; c.turning = false; enter(c);
+      }
+    } else {
+      const was = c.s, r = c.take;
+      c.s += c.v * dt;
+      if (r && was < r.fx && c.s >= r.fx) { c.rp = r; c.rd = c.s - r.fx; c.take = null; c.nd = null; }  // 출발점을 지나는 순간 램프로 옮겨 탐
+      else if (gnd && c.nd && c.mv === 'S' && was < c.x + E && c.s >= c.x + E) { c.nd.done.S++; if (c.h % 2 === 0) c.nd.done.EW++; pick(c); }  // 직진으로 교차로를 지남
+      else if (gnd && c.nd && c.mv !== 'S' && was < c.x - E && c.s >= c.x - E) { c.turning = true; c.d = c.s - (c.x - E); }  // 회전 시작점에 닿음
+      if (!c.rp && c.s > c.len / 2) {  // 차로 끝: 지상 차는 가중치로 고른 차로의 처음으로, 고속도로 차는 자기 차로의 처음으로
+        c.s -= c.len; c.lc = null;
+        if (gnd) { const ln = reenterLane(c); c.lane = ln.id; c.h = ln.h; c.k = ln.k; c.off = ln.off; }
+        enter(c);
+      }
+    }
+    if (c.lc) {  // 차선 변경 진행: 예고(깜빡이만) > 이동(옆으로 옮겨 감) > 끝
+      const l = c.lc; l.t += dt;
+      if (l.ph === 0 && l.t >= LC_SIG) { if (canChange(c, l.to, 25)) { l.ph = 1; l.t = 0; } else c.lc = null; }  // 이동 시작 때 막혀 있으면 깜빡이를 끄고 취소
+      else if (l.ph === 1 && l.t >= LC_MOVE) {
+        const ln = laneInfo(l.to);
+        c.lane = l.to; c.k = ln.k; c.off = ln.off; c.lc = null; lcDone[gnd ? 'g' : 'h']++; enter(c);
+      }
+    } else if (!c.turning && !c.take && c.v >= 3) tryLC(c, dt, ld, lg);
+    place(c); blinker(c, t);
+  }
+}
+
+// 자가 점검: 개발자 콘솔에서 check() 를 부르면 5분을 빨리 감아, 어떤 두 차도 겹치지 않는지,
+// 노드마다 좌회전 직진 우회전이 모두 일어나고 동서 직진도 충분한지(위쪽 교차로는 더 많이), 램프 4개가 모두 쓰이는지, 차선 변경이 지상과 고속도로에서 일어나되 너무 잦지 않은지,
+// 다리 위에 양방향으로 차가 흐르되 다리 끝까지 정체 줄이 밀리지 않는지, 오래 멈춰 선 차(교착)가 없는지 확인
+window.check = () => {
+  let min = Infinity, maxStill = 0, brN = 0, brS = 0, jam = 0, steps = 0;
+  const still = cars.map(() => 0);  // 차마다 연속으로 멈춰 있던 시간(초)
+  for (const n of nodes) n.done.L = n.done.S = n.done.R = n.done.EW = 0;
+  for (const r of ramps) r.done = 0;
+  lcDone.g = lcDone.h = 0;
+  for (let t = 0; t < 300; t += 1 / 30) {
+    step(1 / 30, t);
+    for (let i = 0; i < cars.length; i++) for (let j = i + 1; j < cars.length; j++)
+      min = Math.min(min, cars[i].g.position.distanceTo(cars[j].g.position));
+    cars.forEach((c, i) => {
+      still[i] = c.v < .1 ? still[i] + 1 / 30 : 0; maxStill = Math.max(maxStill, still[i]);
+      const p = c.g.position;
+      if (c.axis !== 'h' && !c.rp && Math.abs(p.x) < RW && p.z > 90) {  // 다리 위(큰길 z > 90)의 지상 차를 방향별로
+        if (c.h === 3) brN++; else brS++;
+        if (c.h === 3 && p.z > 150 && c.v < .5) jam++;                 // 다리 남쪽 끝 가까이 선 북행 차 (정체 줄이 끝까지 밀린 정도)
+      }
+    });
+    steps++;
+  }
+  const bN = brN / steps, bS = brS / steps, bJam = jam / steps;
+  console.assert(min > 2.2, '차가 겹침', min);
+  console.assert(nodes.every(n => n.done.L > 0 && n.done.S > 0 && n.done.R > 0), '안 일어난 움직임이 있음', nodes.map(n => n.done));
+  console.assert(nodes.every(n => n.done.EW >= 20), '동서 직진이 너무 적은 교차로가 있음', nodes.map(n => n.done.EW));
+  console.assert(nodes[1].done.EW >= 60, '위쪽 교차로(길 B)의 동서 직진이 너무 적음', nodes[1].done.EW);
+  console.assert(ramps.every(r => r.done > 0), '안 쓰인 램프가 있음', ramps.map(r => r.done));
+  console.assert(lcDone.g > 0 && lcDone.h > 0, '차선 변경이 한 번도 없는 곳이 있음', lcDone);
+  console.assert(lcDone.g + lcDone.h <= cars.length * 2, '차선 변경이 너무 잦음', lcDone);
+  console.assert(bN >= 3 && bS >= 3, '다리 위 차가 한쪽 방향에 너무 적음', bN, bS);
+  console.assert(bN + bS >= 8, '다리 위 차 합계가 너무 적음', bN + bS);
+  console.assert(bJam < 1, '다리 남쪽 끝까지 북행 정체 줄이 밀림', bJam);
+  console.assert(maxStill < 90, '오래 멈춘 차가 있음 (교착?)', maxStill);
+  return `최소 거리 ${min.toFixed(2)}, ` + nodes.map((n, i) => `노드${i} 좌 ${n.done.L} 직 ${n.done.S}(동서 ${n.done.EW}) 우 ${n.done.R}`).join(', ') + `, 램프 ` + ramps.map((r, i) => `R${i + 1} ${r.done}`).join(' ') +
+    `, 차선 변경 지상 ${lcDone.g} 고속 ${lcDone.h}, 다리 위 평균 북행 ${bN.toFixed(1)} 남행 ${bS.toFixed(1)}, 남쪽 끝 정체 ${bJam.toFixed(2)}대, 최장 정지 ${maxStill.toFixed(1)}초`;
+};
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), .05);
+  step(dt, clock.elapsedTime);
+  sceneryUpdate(dt, clock.elapsedTime);
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</html>
